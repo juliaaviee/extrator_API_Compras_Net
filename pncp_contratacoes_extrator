@@ -1,0 +1,95 @@
+import requests
+import json
+from google.cloud import bigquery
+import functions_framework
+
+# Configurações
+DATA_INICIAL = "20250102"
+DATA_FINAL = "20250328"
+CODIGOS_MODALIDADE = range(1, 14)
+BQ_PROJECT_ID = "NULL"
+BQ_DATASET = "PNCP"
+BQ_TABLE = "Contratacoes"
+
+client = bigquery.Client()
+
+# Função para "achatar" JSON aninhado
+def flatten_json(data, prefix=""):
+    flat_dict = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            new_key = f"{prefix}{key}" if prefix else key
+            if key == 'unidadeorgao_codigounidade' and isinstance(value, str):
+                value = str(value)
+            flat_dict.update(flatten_json(value, f"{new_key}_"))
+    elif isinstance(data, list):
+        for i, item in enumerate(data):
+            flat_dict.update(flatten_json(item, f"{prefix}{i}_"))
+    else:
+        clean_key = prefix[:-1] if prefix.endswith("_") else prefix
+        flat_dict[clean_key] = data
+
+    return flat_dict
+
+# Função para baixar e inserir dados diretamente no BigQuery
+def baixar_e_inserir_modalidade(codigo):
+    pagina = 1
+    total_registros = 0
+    max_pagina = 100  # Limitar o número máximo de páginas a processar para evitar loops infinitos
+
+    while True:
+        url = f"https://pncp.gov.br/api/consulta/v1/contratacoes/publicacao?dataInicial={DATA_INICIAL}&dataFinal={DATA_FINAL}&codigoModalidadeContratacao={codigo}&pagina={pagina}"
+        print(f"📡 Baixando dados para Modalidade {codigo}, Página {pagina}...")
+        response = requests.get(url)
+
+        if response.status_code != 200:
+            print(f"❌ Erro ao baixar modalidade {codigo}, página {pagina}")
+            break
+
+        json_data = response.json()
+        if "data" not in json_data or not json_data["data"]:
+            print(f"⚠️ Nenhum dado encontrado para Modalidade {codigo}, Página {pagina}. Finalizando.")
+            break
+
+        # Transformar dados para BigQuery
+        dados_para_bigquery = [flatten_json(item) for item in json_data["data"]]
+
+        print(f"Preparando {len(dados_para_bigquery)} registros para inserção no BigQuery...")
+        enviar_para_bigquery(dados_para_bigquery)
+
+        total_registros += len(dados_para_bigquery)
+        pagina += 1
+
+        # Verificar se a API indicou que não há mais páginas
+        paginas_restantes = json_data.get("paginasRestantes", 0)
+
+        # Caso o número de páginas restantes seja 0 ou a página atual tenha atingido o limite
+        if paginas_restantes == 0 or pagina > max_pagina:
+            print(f"✅ Não há mais páginas para Modalidade {codigo}. Finalizando.")
+            break
+
+    print(f"✅ Modalidade {codigo}: {total_registros} registros inseridos no BigQuery")
+
+# Função para enviar dados ao BigQuery
+def enviar_para_bigquery(dados):
+    if not dados:
+        print("❌ Nenhum dado para inserir.")
+        return
+
+    print(f"Enviando {len(dados)} registros para o BigQuery...")
+
+    table_id = f"{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+    errors = client.insert_rows_json(table_id, dados)
+
+    if errors:
+        print(f"❌ Erro ao inserir no BigQuery: {errors}")
+    else:
+        print(f"✅ {len(dados)} registros inseridos com sucesso no BigQuery")
+
+# Função principal para o Cloud Function
+@functions_framework.cloud_event
+def processar_dados(cloud_event):
+    for codigo in CODIGOS_MODALIDADE:
+        baixar_e_inserir_modalidade(codigo)
+
+    return "Processamento concluído! Todos os dados foram enviados para o BigQuery.", 200
